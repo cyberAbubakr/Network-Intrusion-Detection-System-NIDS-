@@ -1,0 +1,12 @@
+# Day 1 dependencies only.
+# Day 2 additions (SHAP, LLM/RAG clients, extra datasets) are intentionally excluded.
+
+numpy>=1.26,<2.1
+pandas>=2.1,<2.3
+pyarrow>=14.0        # Parquet I/O
+scikit-learn>=1.4,<1.6
+joblib>=1.3
+pyyaml>=6.0
+pytest>=8.0
+matplotlib>=3.8      # notebooks/ visualizations
+notebook>=7.0        # to run notebooks/*.ipynb
