@@ -1,12 +1,41 @@
 # Cross-Temporal Hybrid Network Intrusion Detection
 
 **Day 1 scope:** data pipeline (discovery -> load -> validate -> clean ->
-feature engineering -> chronological split -> leakage verification) +
-a lightweight Random Forest baseline with standard evaluation metrics.
+feature engineering -> temporal split -> leakage verification) + a
+lightweight Random Forest baseline with standard evaluation metrics.
 
 Day 2+ (Isolation Forest, hybrid fusion, SHAP explainability, LLM/RAG
 reporting, CSE-CIC-IDS2018 / CTU-IDSEVAL-6 / BigFlow-NIDS datasets) is
 **out of scope for this codebase** and is not implemented here.
+
+## Temporal splitting: two mechanisms, chosen automatically
+
+Not every CIC-IDS2017 distribution retains a row-level `Timestamp`
+column — some cleaned/re-hosted copies drop it along with Flow ID/IPs/
+ports. `scripts/prepare_data.py` handles both cases explicitly, and
+records which one was actually used in `split_metadata.json`
+(`"split_method"`):
+
+* **`row_timestamp`** (primary path) — used automatically when a real
+  timestamp column is detected. Row-level chronological split; see
+  `src/data/temporal_split.py`'s `chronological_train_test_split` /
+  `verify_no_temporal_leakage`.
+* **`capture_day`** (fallback) — used automatically when no timestamp
+  column exists. Splits by the dataset's original per-capture-day file
+  identity (Monday..Friday), inferred **only** from filenames, never
+  guessed. Because CIC-IDS2017 attacks are day-specific by design, train
+  and test days will not share the same class distribution — this is an
+  inherent property of the dataset and is documented in
+  `notebooks/03_temporal_split.ipynb` / `04_baseline_model.ipynb`, not
+  concealed. If day identity can't be recovered from filenames either,
+  the pipeline fails loudly rather than fabricating an ordering. See
+  `src/data/temporal_split.py`'s `detect_capture_day` /
+  `day_based_train_test_split` / `verify_no_day_leakage`.
+
+Neither mechanism ever infers time from flow-statistical features (e.g.
+`Flow IAT Mean`/`Flow IAT Min`) — those describe inter-arrival timing
+within a flow, not when the flow occurred, and are never used as a
+timestamp substitute.
 
 ## Status
 
@@ -28,16 +57,16 @@ cross-temporal-hybrid-nids/
 │   │   ├── validator.py           # schema + NaN/Inf validation
 │   │   ├── cleaner.py             # label normalization + NaN/Inf handling (logged)
 │   │   ├── feature_engineering.py # leakage-prone feature ID + lightweight selection
-│   │   └── temporal_split.py      # timestamp detection, chronological split, leakage check
+│   │   └── temporal_split.py      # timestamp OR capture-day detection, split, leakage check
 ├── scripts/
 │   ├── inspect_dataset.py   # schema/NaN-Inf spot check (cheap, run first)
-│   ├── prepare_data.py      # full Day 1 preprocessing pipeline
+│   ├── prepare_data.py      # full Day 1 preprocessing pipeline (auto timestamp/day fallback)
 │   └── train_baseline.py    # Random Forest baseline + evaluation
 ├── notebooks/
 │   ├── 01_dataset_inspection.ipynb    # discovery, schema, labels, missing/inf, timestamps
 │   ├── 02_data_preprocessing.ipynb    # loading, validation, leakage ID, feature selection
-│   ├── 03_temporal_split.ipynb        # chronological split + explicit leakage verification
-│   └── 04_baseline_model.ipynb        # Random Forest baseline training + full evaluation
+│   ├── 03_temporal_split.ipynb        # day-based split (this dataset has no row timestamp)
+│   └── 04_baseline_model.ipynb        # Random Forest baseline + full evaluation, split-aware
 ├── models/day1/              # trained model + metadata (created by train_baseline.py)
 ├── results/day1/             # evaluation metrics (created by train_baseline.py)
 ├── tests/                    # unit tests using tiny synthetic data only
@@ -46,39 +75,23 @@ cross-temporal-hybrid-nids/
 
 ### `src/` vs `scripts/` vs `notebooks/`
 
-* **`src/`** contains the reusable implementation code (dataset discovery,
-  chunked loading, validation, cleaning, feature engineering, temporal
-  splitting). This is the only place the actual logic lives — everything
-  else calls into it rather than duplicating it.
+* **`src/`** contains the reusable implementation code. This is the only
+  place the actual logic lives — everything else calls into it rather
+  than duplicating it.
 * **`scripts/`** provides command-line execution of that logic end to
-  end (`inspect_dataset.py`, `prepare_data.py`, `train_baseline.py`),
-  meant to be run non-interactively, e.g. in a terminal or CI.
+  end, meant to be run non-interactively.
 * **`notebooks/`** provides research/academic demonstrations of the same
-  pipeline — exploration, visualization, and step-by-step walkthroughs
-  for a reader or reviewer. Notebooks call functions from `src/`; they do
-  not re-implement any pipeline logic themselves.
+  pipeline — exploration, visualization, step-by-step walkthroughs.
+  Notebooks call functions from `src/`; they do not re-implement any
+  pipeline logic themselves.
 
-## Notebooks
-
-The `notebooks/` directory mirrors the Day 1 pipeline stage by stage:
-
-| Notebook | Demonstrates |
-|---|---|
-| `01_dataset_inspection.ipynb` | file discovery, schema peek, columns/dtypes, label distribution, missing/infinite values, timestamp discovery, basic plots |
-| `02_data_preprocessing.ipynb` | Parquet-preferred/CSV-fallback loading, schema/NaN-Inf validation, leakage-prone feature identification, feature selection, label normalization |
-| `03_temporal_split.ipynb` | timestamp distribution, chronological ordering, the chronological train/test split (**not** a random split), explicit temporal-leakage verification, and a visualization of the split |
-| `04_baseline_model.ipynb` | loading the prepared split, training the Day 1 Random Forest baseline, confusion matrix, Precision/Recall/F1, ROC-AUC/PR-AUC, FPR/FNR, feature importance, and saving the model |
-
-**Status:** the notebooks contain properly written cells calling into
-`src/`, but have **not** been executed against the real dataset — no
-outputs are stored. Run them yourself, in order, after placing the real
-CIC-IDS2017 files under `data/raw/CIC-IDS2017/` and (for
-`04_baseline_model.ipynb`) after running `scripts/prepare_data.py`.
-
-```bash
-pip install -r requirements.txt   # includes jupyter/notebook + matplotlib
-jupyter notebook notebooks/
-```
+**Status of the notebooks:** they contain properly written cells calling
+into `src/`, but have **not** been executed against the real dataset —
+no outputs are stored. Run them yourself, in order, after placing the
+real CIC-IDS2017 files under `data/raw/CIC-IDS2017/` (with their
+original per-day filenames preserved, e.g.
+`Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv`) and, for
+`04_baseline_model.ipynb`, after running `scripts/prepare_data.py`.
 
 ## Getting the dataset
 
@@ -110,6 +123,11 @@ python scripts/prepare_data.py --raw-dir data/raw/CIC-IDS2017 --chunk-size 25000
 
 #    If timestamp auto-detection doesn't find the right column, re-run with:
 # python scripts/prepare_data.py --timestamp-column "<exact column name>"
+
+#    If your dataset has NO timestamp column at all, prepare_data.py
+#    automatically falls back to day-based splitting (test day defaults
+#    to Friday). To choose different days:
+# python scripts/prepare_data.py --test-days friday --train-days monday,tuesday,wednesday,thursday
 
 # 3. Train + evaluate the Random Forest baseline
 python scripts/train_baseline.py

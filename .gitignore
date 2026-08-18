@@ -1,47 +1,21 @@
-# Datasets (never commit raw or processed data)
-data/raw/**/*.csv
-data/raw/**/*.parquet
-data/raw/**/*.zip
-data/processed/**/*.parquet
-data/processed/**/*.csv
-
-# Models / large artifacts
-models/**/*.joblib
-models/**/*.pkl
-models/**/*.json
-!models/**/.gitkeep
-
-# Results (generated, not source)
-results/**/*.png
-results/**/*.csv
-results/**/*.json
-!results/**/.gitkeep
-
-# Logs
-logs/*.log
-!logs/.gitkeep
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.eggs/
-build/
-dist/
-
-# Virtual environments
 .venv/
-venv/
-env/
-
-# Caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+__pycache__/
+*.pyc
 .ipynb_checkpoints/
 
-# OS / editor
-.DS_Store
+logs/
+
+data/raw/
+data/processed/
+
+models/
+results/
+
+*.zip
+*.joblib
+*.pkl
+*.pickle
+
+.env
 .vscode/
 .idea/
