@@ -19,3 +19,5 @@ results/
 .env
 .vscode/
 .idea/
+
+data/external/

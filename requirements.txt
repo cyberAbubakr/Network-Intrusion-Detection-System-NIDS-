@@ -10,3 +10,4 @@ pyyaml>=6.0
 pytest>=8.0
 matplotlib>=3.8      # notebooks/ visualizations
 notebook>=7.0        # to run notebooks/*.ipynb
+scipy>=1.11          # Day 4: Mann-Whitney U distribution-shift tests (already an indirect scikit-learn dependency; now imported directly)
