@@ -1,52 +1,281 @@
-# Cross-Temporal Hybrid Network Intrusion Detection
 
-**Day 1 scope:** data pipeline (discovery -> load -> validate -> clean ->
-feature engineering -> temporal split -> leakage verification) + a
-lightweight Random Forest baseline with standard evaluation metrics.
+```Cross-Temporal Hybrid Network Intrusion Detection System
 
-Day 2+ (Isolation Forest, hybrid fusion, SHAP explainability, LLM/RAG
-reporting, CSE-CIC-IDS2018 / CTU-IDSEVAL-6 / BigFlow-NIDS datasets) is
-**out of scope for this codebase** and is not implemented here.
+A research-oriented Network Intrusion Detection System (NIDS) that evaluates whether machine-learning detectors trained on earlier network traffic remain reliable across time, unseen attack classes, distribution shift, and a different dataset.
 
-## Temporal splitting: two mechanisms, chosen automatically
+The project combines a supervised Random Forest, an unsupervised Isolation Forest, and a weighted hybrid detector. It is designed for CPU-only systems with limited memory and uses leakage-aware temporal evaluation rather than a random train/test split.
 
-Not every CIC-IDS2017 distribution retains a row-level `Timestamp`
-column — some cleaned/re-hosted copies drop it along with Flow ID/IPs/
-ports. `scripts/prepare_data.py` handles both cases explicitly, and
-records which one was actually used in `split_metadata.json`
-(`"split_method"`):
+Project Status
 
-* **`row_timestamp`** (primary path) — used automatically when a real
-  timestamp column is detected. Row-level chronological split; see
-  `src/data/temporal_split.py`'s `chronological_train_test_split` /
-  `verify_no_temporal_leakage`.
-* **`capture_day`** (fallback) — used automatically when no timestamp
-  column exists. Splits by the dataset's original per-capture-day file
-  identity (Monday..Friday), inferred **only** from filenames, never
-  guessed. Because CIC-IDS2017 attacks are day-specific by design, train
-  and test days will not share the same class distribution — this is an
-  inherent property of the dataset and is documented in
-  `notebooks/03_temporal_split.ipynb` / `04_baseline_model.ipynb`, not
-  concealed. If day identity can't be recovered from filenames either,
-  the pipeline fails loudly rather than fabricating an ordering. See
-  `src/data/temporal_split.py`'s `detect_capture_day` /
-  `day_based_train_test_split` / `verify_no_day_leakage`.
+Stage| Work| Status
+Day 1| CIC-IDS2017 preprocessing, feature selection, temporal split, Random Forest baseline| Complete
+Day 2| Validation, threshold selection, Isolation Forest, hybrid fusion, alerts| Complete
+Day 3| Simulated zero-day evaluation using unseen attack classes| Complete
+Day 4| Distribution-shift and unseen-attack analysis| Complete
+Day 5| Cross-dataset validation on CSE-CIC-IDS2018| Complete
+Day 6| SHAP model explainability| Planned
+Day 7| LLM/RAG-assisted alert explanation and reporting| Planned
 
-Neither mechanism ever infers time from flow-statistical features (e.g.
-`Flow IAT Mean`/`Flow IAT Min`) — those describe inter-arrival timing
-within a flow, not when the flow occurred, and are never used as a
-timestamp substitute.
+Current state: the detection, validation, zero-day, distribution-shift, and cross-dataset stages are implemented. SHAP explainability and LLM/RAG reporting are the remaining stages.
 
-## Status
+Research Objective
 
-This repository currently contains **code only** — no dataset has been
-downloaded or processed, and no model has been trained on real data.
-Every script that touches real data must be run manually by you; nothing
-runs automatically.
+Many intrusion-detection experiments use random splitting, allowing similar traffic from the same collection period to appear in both training and testing. This can produce optimistic results.
 
-## Project layout
+This project instead asks:
 
-```
+«Can a detector trained on earlier traffic continue to identify attacks in later traffic, unseen attack classes, and an independently collected dataset without retraining or tuning on test data?»
+
+Implemented Pipeline
+
+Day 1 — Temporal Random Forest Baseline
+
+- Discovers CIC-IDS2017 CSV or Parquet files.
+- Normalizes labels, validates schemas, and handles invalid numeric values.
+- Removes label-like, duplicate, and near-constant features.
+- Produces 58 numeric model features.
+- Uses Monday–Thursday traffic for training and Friday traffic for temporal testing when row-level timestamps are unavailable.
+- Verifies that capture days do not leak between training and testing.
+- Trains a lightweight Random Forest and freezes its selected threshold.
+
+Latest recorded frozen Friday Random Forest results:
+
+Metric| Value
+Precision| 0.8235
+Recall| 0.8819
+F1-score| 0.8517
+ROC-AUC| 0.9695
+PR-AUC| 0.9101
+False-positive rate| 0.0645
+False-negative rate| 0.1181
+
+Day 2 — Anomaly Detection and Hybrid Fusion
+
+- Creates a validation partition without tuning on the final Friday test set.
+- Trains an Isolation Forest and normalizes its anomaly scores.
+- Selects thresholds using validation data only.
+- Combines Random Forest and anomaly scores using weighted fusion.
+- Freezes thresholds before final temporal evaluation.
+- Produces comparison tables, per-class metrics, and sample alerts.
+
+Component| Frozen configuration
+Random Forest threshold| 0.01
+Isolation Forest threshold| 0.15
+Hybrid threshold| 0.50
+Random Forest weight| 0.70
+Anomaly weight| 0.30
+
+Day 3 — Simulated Zero-Day Detection
+
+The supervised model is trained while deliberately excluding:
+
+- Bot
+- DDoS
+- PortScan
+
+These excluded classes are treated as unseen attacks during evaluation. The experiment compares the Random Forest, Isolation Forest, and hybrid detector on attack types unavailable during supervised training.
+
+The results preserve an important negative finding: the hybrid model does not automatically outperform both component models on every unseen class.
+
+Day 4 — Distribution-Shift Analysis
+
+- Compares feature distributions between Monday–Thursday training traffic and Friday traffic.
+- Measures changes in Random Forest confidence.
+- Relates important feature drift to temporal performance degradation.
+- Runs distribution-shift tests across the selected features.
+- Separately analyzes known and unseen attack behaviour.
+- Preserves negative findings instead of presenting the hybrid detector as universally superior.
+
+Important drifting features include:
+
+- Packet Length Max
+- Bwd Packet Length Std
+- Packet Length Variance
+- Packet Length Std
+- Packet Length Mean
+- Bwd Packet Length Mean
+- Bwd Packet Length Max
+- Flow Packets/s
+
+Day 5 — Cross-Dataset Validation
+
+The frozen CIC-IDS2017 models and thresholds are evaluated on CSE-CIC-IDS2018 without retraining or tuning on external data.
+
+The cross-dataset pipeline:
+
+- Maps CICFlowMeter feature-name variants.
+- Coerces mapped values to numeric.
+- Replaces positive and negative infinity with missing values.
+- Imputes missing values using CIC-IDS2017 training medians only.
+- Maps external labels to a consistent binary target.
+- Records unmatched features.
+- Verifies that external data is not used for training or threshold selection.
+- Compares Random Forest, Isolation Forest, and hybrid generalization.
+
+Experimental Safeguards
+
+- No random train/test leakage: evaluation is separated by capture day when timestamps are unavailable.
+- No threshold tuning on the final test set: thresholds are selected on validation data and frozen.
+- No external-data retraining: CSE-CIC-IDS2018 is used only for evaluation.
+- Training-only imputation: external missing values use CIC-IDS2017 training medians.
+- No invented timestamps: flow timing statistics are never treated as capture timestamps.
+- Negative results are retained: the hybrid model is not claimed to be universally better.
+- Resource-aware processing: CSV input is processed in chunks and Parquet is preferred.
+
+Repository Structure
+
+.
+├── data/
+├── models/
+├── results/
+├── notebooks/
+│   ├── 01_dataset_inspection.ipynb
+│   ├── 02_data_preprocessing.ipynb
+│   ├── 03_temporal_split.ipynb
+│   ├── 04_baseline_model.ipynb
+│   ├── 06_day2_validation_anomaly_hybrid.ipynb
+│   ├── 07_day3_zero_day_detection.ipynb
+│   ├── 08_day4_explainability_unseen_attack_analysis.ipynb
+│   └── 09_day5_cross_dataset_validation.ipynb
+├── scripts/
+│   ├── inspect_dataset.py
+│   ├── prepare_data.py
+│   ├── train_baseline.py
+│   ├── run_day2.py
+│   ├── run_day3.py
+│   ├── run_day4.py
+│   └── run_day5.py
+├── src/
+│   ├── data/
+│   ├── day2/
+│   ├── day3/
+│   ├── day4/
+│   └── day5/
+├── tests/
+├── requirements.txt
+└── README.md
+
+Large datasets, generated models, and most experiment outputs are intentionally excluded from Git.
+
+Datasets
+
+CIC-IDS2017
+
+CIC-IDS2017 is used for:
+
+- Data preprocessing
+- Model training
+- Validation
+- Temporal Friday testing
+- Simulated zero-day evaluation
+- Distribution-shift analysis
+
+Place the original files under:
+
+data/raw/CIC-IDS2017/
+
+Keep their original filenames because capture-day detection uses file identity when a reliable row-level timestamp is unavailable.
+
+CSE-CIC-IDS2018
+
+CSE-CIC-IDS2018 is used only for cross-dataset evaluation. It must never be included in training or threshold selection.
+
+Installation
+
+Python 3.12 is recommended.
+
+Linux/macOS
+
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+Windows PowerShell
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+Running the Project
+
+Run the following commands from the repository root:
+
+# Inspect CIC-IDS2017 files
+python scripts/inspect_dataset.py --raw-dir data/raw/CIC-IDS2017
+
+# Prepare the leakage-aware Day 1 dataset
+python scripts/prepare_data.py --raw-dir data/raw/CIC-IDS2017 --chunk-size 250000
+
+# Train and evaluate the Random Forest baseline
+python scripts/train_baseline.py
+
+# Run validation, Isolation Forest, hybrid fusion, and frozen evaluation
+python scripts/run_day2.py
+
+# Run simulated zero-day evaluation
+python scripts/run_day3.py
+
+# Run distribution-shift and unseen-attack analysis
+python scripts/run_day4.py
+
+# Run cross-dataset validation
+python scripts/run_day5.py
+
+The notebooks demonstrate the same research stages while calling reusable functions from "src/".
+
+Tests
+
+Tests use small synthetic inputs and do not require the complete datasets.
+
+pytest -q
+
+The test suite covers:
+
+- Data preprocessing
+- Temporal splitting
+- Leakage verification
+- Threshold selection
+- Anomaly scoring
+- Hybrid fusion
+- Zero-day evaluation logic
+- Distribution-shift analysis
+- Feature and label mapping
+- Infinity and missing-value handling
+- Cross-dataset leakage safeguards
+
+Key Finding
+
+A hybrid detector is not automatically more robust simply because it combines supervised and unsupervised models.
+
+Its performance depends on:
+
+- Score calibration
+- Fusion weights
+- Decision thresholds
+- Attack type
+- Temporal distribution shift
+- Cross-dataset differences
+
+Weaker hybrid results are therefore treated as valid research findings rather than hidden.
+
+Remaining Work
+
+SHAP Explainability
+
+The next stage will explain Random Forest predictions at global and individual-alert levels, including the features that raise or lower predicted attack risk.
+
+LLM/RAG Reporting
+
+The final planned stage will convert structured model outputs and SHAP evidence into readable analyst-facing alert explanations.
+
+The language model will explain existing evidence; it will not replace the detector or invent unsupported causes.
+
+Author
+
+Syed Muhammad Abubakr
+BS Computer Science
+GitHub: "cyberAbubakr" (https://github.com/cyberAbubakr)
+
 cross-temporal-hybrid-nids/
 ├── data/
 │   ├── raw/CIC-IDS2017/{parquet,csv}/   # put the real dataset files here
