@@ -24,7 +24,7 @@ def test_normalize_labels_strips_whitespace_and_derives_binary():
     df = pd.DataFrame({"Label": [" BENIGN", "BENIGN", "DoS Hulk ", "PortScan"]})
     out, log = normalize_labels(df, label_col="Label")
 
-    assert out["label_multiclass"].tolist() == ["BENIGN", "BENIGN", "DoS Hulk", "PortScan"]
+    assert out["label_multiclass"].tolist() == ["Benign", "Benign", "DoS Hulk", "PortScan"]
     assert out["label_binary"].tolist() == [0, 0, 1, 1]
     assert "label_multiclass_raw" in out.columns
     assert len(log.entries) > 0

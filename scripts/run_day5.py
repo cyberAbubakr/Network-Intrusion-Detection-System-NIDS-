@@ -34,6 +34,20 @@ status="pipeline_ready_dataset_required", documents exactly where to
 place the data and the exact command to re-run, and exits 0 (this is
 an expected, valid state -- not a script error).
 
+CICFlowMeter-derived CSVs (including CSE-CIC-IDS2018) commonly contain
++inf/-inf values (e.g. Flow Bytes/s or Flow Packets/s when Flow
+Duration is 0). These are replaced with NaN and then imputed with
+CIC-IDS2017 TRAINING medians -- pandas' fillna() does NOT treat inf as
+missing, so the replace-then-fillna order below is required; fillna()
+alone would leave inf values in place.
+
+Memory note: the external CSV(s) can be very large (CSE-CIC-IDS2018 day
+files run into the millions of rows). CSV reading is chunked
+(chunksize=50_000) to reduce peak memory during parsing. All rows are
+still evaluated -- --sample-cap only limits the distribution-shift
+statistical tests (Mann-Whitney U), never the detector metrics, which
+are always computed over every successfully processed external row.
+
 Critical scientific rules enforced structurally:
     - This script never imports select_threshold_from_validation --
       thresholds are read from Day 1/Day 2's frozen artifacts only.
@@ -43,10 +57,14 @@ Critical scientific rules enforced structurally:
     - The external dataset is used only for evaluation and
       distribution-shift comparison, never for fitting or threshold
       selection.
+    - Imputation (for unmapped features AND for inf/NaN cleanup) uses
+      only CIC-IDS2017 Day 1 training medians -- never a statistic
+      computed from the external data itself.
 
 Outputs (results/day5/ only -- never Day 1-4 outputs):
     results/day5/feature_mapping.json
     results/day5/label_mapping.json
+    results/day5/label_mapping_table.csv
     results/day5/comparison_table.csv
     results/day5/attack_family_results.csv   (if attack-family labels available)
     results/day5/distribution_shift.csv
@@ -80,6 +98,7 @@ FALLBACK_HYBRID_THRESHOLD = 0.50
 
 TOP_N_FEATURES_FOR_SHIFT = 20
 DEFAULT_SAMPLE_CAP = 20_000
+DEFAULT_CSV_CHUNK_SIZE = 50_000
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -95,7 +114,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dataset-name", type=str, default="CSE-CIC-IDS2018")
     parser.add_argument("--external-label-col", type=str, default=None, help="Override auto-detected label column.")
-    parser.add_argument("--sample-cap", type=int, default=DEFAULT_SAMPLE_CAP)
+    parser.add_argument(
+        "--sample-cap", type=int, default=DEFAULT_SAMPLE_CAP,
+        help="Caps ONLY the distribution-shift statistical tests (Mann-Whitney U). "
+             "Detector evaluation (comparison_table.csv etc.) always uses every "
+             "successfully processed external row, never a sample.",
+    )
+    parser.add_argument(
+        "--csv-chunk-size", type=int, default=DEFAULT_CSV_CHUNK_SIZE,
+        help="Row-chunk size used when reading external CSV file(s), to reduce peak memory during parsing.",
+    )
     parser.add_argument("--random-state", type=int, default=42)
     return parser
 
@@ -108,6 +136,31 @@ def setup_logging() -> logging.Logger:
         handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_DIR / "run_day5.log")],
     )
     return logging.getLogger("run_day5")
+
+
+def _load_external_csvs_chunked(csv_paths, chunk_size: int, logger: logging.Logger):
+    """
+    Read one or more CSV files in row-chunks (reduces peak memory during
+    parsing compared to reading each whole file at once) and concatenate
+    the result into a single DataFrame. All rows from all files are
+    included -- this is a memory-friendlier read, not a sample.
+    """
+    import pandas as pd
+
+    chunks = []
+    total_rows = 0
+    for csv_path in csv_paths:
+        file_rows = 0
+        for chunk in pd.read_csv(csv_path, low_memory=False, chunksize=chunk_size):
+            chunk.columns = [c.strip() for c in chunk.columns]
+            chunks.append(chunk)
+            file_rows += len(chunk)
+        total_rows += file_rows
+        logger.info("Read %d row(s) from %s (chunksize=%d).", file_rows, csv_path, chunk_size)
+
+    external_df = pd.concat(chunks, ignore_index=True)
+    del chunks
+    return external_df
 
 
 def main() -> int:
@@ -246,6 +299,7 @@ def main() -> int:
                 "label mapping (src.day5.label_mapping, reuses src.data.cleaner.normalize_labels)",
                 "frozen-threshold evaluation (reuses src.day2.thresholding.evaluate_frozen_threshold)",
                 "distribution-shift testing (reuses src.day4.analysis.distribution_shift_tests)",
+                "inf/NaN cleanup using CIC-IDS2017 training medians (never external statistics)",
             ],
             "note": (
                 "feature_mapping.json and label_mapping.json cannot be produced "
@@ -277,11 +331,14 @@ def main() -> int:
         return 0
 
     # -----------------------------------------------------------------
-    # Load and concatenate external CSVs.
+    # Load external CSV(s) in row-chunks to reduce peak memory during
+    # parsing. All rows are kept -- this is not a sample.
     # -----------------------------------------------------------------
-    logger.info("Found %d external CSV file(s) in %s. Loading...", len(external_csvs), args.external_dir)
-    external_df = pd.concat([pd.read_csv(p, low_memory=False) for p in external_csvs], ignore_index=True)
-    external_df.columns = [c.strip() for c in external_df.columns]
+    logger.info(
+        "Found %d external CSV file(s) in %s. Loading (chunked, chunksize=%d)...",
+        len(external_csvs), args.external_dir, args.csv_chunk_size,
+    )
+    external_df = _load_external_csvs_chunked(external_csvs, args.csv_chunk_size, logger)
     logger.info("External dataset loaded: %d rows, %d columns.", len(external_df), external_df.shape[1])
 
     # -----------------------------------------------------------------
@@ -309,6 +366,8 @@ def main() -> int:
 
     # -----------------------------------------------------------------
     # Feature mapping -- never silently drops a CIC-IDS2017 feature.
+    # Unchanged from the existing approach: unmapped features are
+    # imputed with training medians, never invented mappings.
     # -----------------------------------------------------------------
     mapping = build_feature_mapping(feature_names, external_df.columns)
     (args.results_dir / "feature_mapping.json").write_text(json.dumps(mapping.summary(), indent=2, default=str))
@@ -327,12 +386,46 @@ def main() -> int:
         )
 
     external_mapped = apply_feature_mapping(external_df, mapping, train_medians)
-    external_mapped = external_mapped.fillna(train_medians)
-    assert not external_mapped.isna().any().any(), "NaNs remain in mapped external features after imputation."
-    assert not np.isinf(external_mapped.to_numpy()).any(), "Inf values present in mapped external features."
 
     # -----------------------------------------------------------------
-    # Score the external dataset once with each detector.
+    # Inf/NaN cleanup. CICFlowMeter-derived CSVs (including
+    # CSE-CIC-IDS2018) commonly contain +inf/-inf (e.g. rate features
+    # divided by a zero Flow Duration). pandas' fillna() does NOT treat
+    # inf as missing, so +inf/-inf must be replaced with NaN FIRST,
+    # then imputed -- using CIC-IDS2017 TRAINING medians only, never a
+    # statistic derived from the external data.
+    # -----------------------------------------------------------------
+    raw_values = external_mapped.to_numpy(dtype=float)
+    n_pos_inf = int(np.isposinf(raw_values).sum())
+    n_neg_inf = int(np.isneginf(raw_values).sum())
+    n_inf_total = n_pos_inf + n_neg_inf
+    n_nan_before = int(external_mapped.isna().sum().sum())
+
+    logger.info(
+        "Inf/NaN scan on mapped external features: %d +inf, %d -inf (%d total inf), "
+        "%d pre-existing NaN. Replacing all with NaN, then imputing with CIC-IDS2017 "
+        "training medians.",
+        n_pos_inf, n_neg_inf, n_inf_total, n_nan_before,
+    )
+
+    external_mapped = external_mapped.replace([np.inf, -np.inf], np.nan)
+    n_nan_after_inf_replacement = int(external_mapped.isna().sum().sum())
+    external_mapped = external_mapped.fillna(train_medians)
+
+    logger.info(
+        "Imputation complete: %d value(s) (%d inf + %d pre-existing NaN) filled with "
+        "CIC-IDS2017 training medians.",
+        n_nan_after_inf_replacement, n_inf_total, n_nan_before,
+    )
+
+    assert not external_mapped.isna().any().any(), "NaNs remain in mapped external features after imputation."
+    assert not np.isinf(external_mapped.to_numpy()).any(), "Inf values present in mapped external features."
+    logger.info("Integrity check passed: no NaN/inf remain in mapped external features after imputation.")
+
+    # -----------------------------------------------------------------
+    # Score the external dataset once with each detector. Every
+    # successfully processed row is scored -- --sample-cap does not
+    # apply here (only to the distribution-shift tests below).
     # -----------------------------------------------------------------
     if_config = {}
     if day2_metadata_path.exists():
@@ -378,7 +471,7 @@ def main() -> int:
         )
     comparison = pd.DataFrame(comparison_rows)
     comparison.to_csv(args.results_dir / "comparison_table.csv", index=False)
-    logger.info("Cross-dataset comparison:\n%s", comparison.to_string())
+    logger.info("Cross-dataset comparison (all %d external rows):\n%s", n_total, comparison.to_string())
 
     # -----------------------------------------------------------------
     # Per attack-family results, if the external dataset has more than
@@ -401,6 +494,11 @@ def main() -> int:
     # unmodified) -- restricted to features that were actually mapped
     # from real external columns (imputed placeholder features would
     # produce a degenerate, meaningless "shift" of ~0%).
+    #
+    # --sample-cap applies ONLY here (Mann-Whitney U on a capped random
+    # sample per group, for computational feasibility) -- it never
+    # limits the detector evaluation above, which always uses all
+    # n_total rows.
     # -----------------------------------------------------------------
     importances = rf_feature_importances(rf_model, feature_names)
     top_features = top_n_features(importances, TOP_N_FEATURES_FOR_SHIFT)
@@ -483,7 +581,7 @@ def main() -> int:
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     for ax, (detector_name, row) in zip(axes, comparison.set_index("detector").iterrows()):
         cm = np.array([[row["tn"], row["fp"]], [row["fn"], row["tp"]]])
-        im = ax.imshow(cm, cmap="Blues")
+        ax.imshow(cm, cmap="Blues")
         ax.set_xticks([0, 1]); ax.set_xticklabels(["Pred Benign", "Pred Attack"])
         ax.set_yticks([0, 1]); ax.set_yticklabels(["True Benign", "True Attack"])
         for i in range(2):
@@ -514,7 +612,6 @@ def main() -> int:
     if_row = comparison[comparison["detector"] == "isolation_forest"].iloc[0]
     hybrid_row = comparison[comparison["detector"] == "hybrid"].iloc[0]
 
-    degrades = rf_row["f1"] < 0.5  # descriptive flag only, not a tuned threshold
     findings = [
         f"Random Forest F1 on {args.dataset_name}: {rf_row['f1']:.4f} (recall={rf_row['recall']:.4f}, precision={rf_row['precision']:.4f}), "
         f"using the frozen CIC-IDS2017 threshold {rf_threshold} without any external-data tuning.",
@@ -551,6 +648,13 @@ def main() -> int:
             "itself, and should be considered when interpreting RF/IsolationForest "
             "scores on this dataset."
         )
+    if n_inf_total:
+        findings.append(
+            f"{n_inf_total} +inf/-inf value(s) were found in the mapped external "
+            "features (common in CICFlowMeter-derived rate features such as "
+            "Flow Bytes/s when Flow Duration is 0) and were replaced with NaN, then "
+            "imputed with CIC-IDS2017 training medians before scoring."
+        )
 
     interpretation = {
         "research_question": "Does the NIDS generalize when evaluated on traffic from a different dataset/distribution?",
@@ -563,6 +667,9 @@ def main() -> int:
             "in the abstract.",
             f"{len(mapping.unmapped_cic2017_features)}/{len(feature_names)} features required "
             "imputation rather than being genuinely observed on the external dataset.",
+            f"{n_inf_total} inf value(s) and {n_nan_before} pre-existing NaN value(s) in the "
+            "mapped features were imputed with training medians rather than being genuinely "
+            "observed finite values.",
             "No model was retrained. No threshold was tuned using external data. All "
             "thresholds and model artifacts are reused exactly as frozen in Day 1/Day 2.",
         ],
@@ -572,6 +679,8 @@ def main() -> int:
             {
                 "status": "completed",
                 "dataset_name": args.dataset_name,
+                "n_external_rows_processed": n_total,
+                "n_inf_values_found_and_replaced": n_inf_total,
                 "comparison_table": comparison.to_dict(orient="records"),
                 "interpretation": interpretation,
             },
@@ -589,7 +698,16 @@ def main() -> int:
         "status": "completed",
         "dataset_name": args.dataset_name,
         "external_files_used": [str(p) for p in external_csvs],
+        "csv_chunk_size": args.csv_chunk_size,
         "n_external_rows": n_total,
+        "inf_nan_handling": {
+            "n_pos_inf_found": n_pos_inf,
+            "n_neg_inf_found": n_neg_inf,
+            "n_inf_total_found": n_inf_total,
+            "n_pre_existing_nan_found": n_nan_before,
+            "n_values_imputed_with_training_medians": n_nan_after_inf_replacement,
+            "imputation_source": "CIC-IDS2017 Day 1 training medians only -- never external statistics",
+        },
         "frozen_thresholds": {
             "random_forest": rf_threshold, "isolation_forest": if_threshold,
             "hybrid": hybrid_threshold, "source": threshold_source,
@@ -600,7 +718,9 @@ def main() -> int:
         "features_excluded_from_shift": excluded_from_shift,
         "statistical_methodology": {
             "test": "Mann-Whitney U (two-sided)", "effect_sizes": ["rank_biserial_correlation", "cohens_d"],
-            "sample_cap": args.sample_cap, "random_state": args.random_state,
+            "sample_cap": args.sample_cap,
+            "sample_cap_scope": "distribution_shift_tests ONLY -- detector evaluation always uses all n_external_rows",
+            "random_state": args.random_state,
         },
         "integrity_checks_passed": [
             "rf_and_if_pre_fitted_before_external_use",

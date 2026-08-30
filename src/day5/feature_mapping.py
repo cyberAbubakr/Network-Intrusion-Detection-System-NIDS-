@@ -12,6 +12,15 @@ either dataset's exact spelling. Nothing is silently dropped -- every
 CIC-IDS2017 feature that cannot be matched is recorded explicitly, and
 is imputed with a CIC-IDS2017 TRAINING statistic (never derived from
 external data) when the mapped DataFrame is built.
+
+``apply_feature_mapping`` additionally guarantees its output contains
+no NaN or +inf/-inf values: CICFlowMeter-derived CSVs (including
+CSE-CIC-IDS2018) commonly contain +inf/-inf in rate-style features
+(e.g. Flow Bytes/s when Flow Duration is 0), and pandas' ``fillna()``
+does not treat inf as missing. Infinities are replaced with NaN first,
+then all NaN (from inf-replacement, coercion failures, or genuinely
+missing external values) is imputed using CIC-IDS2017 training medians
+only -- never a statistic computed from the external data.
 """
 
 from __future__ import annotations
@@ -145,10 +154,26 @@ def apply_feature_mapping(
     """
     Build a DataFrame with exactly ``mapping.cic2017_features`` as
     columns, in that order, using the external dataset's mapped columns
-    where available. Any CIC-IDS2017 feature that could not be mapped
-    is filled with the CIC-IDS2017 TRAINING median for that feature
-    (never derived from the external data, never silently dropped --
-    already recorded in ``mapping.unmapped_cic2017_features``).
+    where available, fully sanitized for downstream model scoring.
+
+    Pipeline:
+        1. Mapped columns are coerced to numeric (``errors="coerce"``);
+           any CIC-IDS2017 feature that could not be mapped is filled
+           with the CIC-IDS2017 TRAINING median for that feature.
+        2. ``+inf``/``-inf`` (common in CICFlowMeter-derived rate
+           features, e.g. Flow Bytes/s when Flow Duration is 0) are
+           detected, logged, and replaced with NaN.
+        3. All resulting NaN (coercion failures, inf-replacement, and
+           genuinely missing external values alike) are imputed using
+           ``train_medians`` ONLY -- never a statistic computed from
+           the external data itself.
+        4. The result is verified to contain no remaining NaN or
+           infinite values; violations raise ``ValueError`` rather
+           than silently returning bad data.
+
+    Callers can rely on the returned DataFrame being fully finite and
+    ready for ``model.predict_proba`` / ``score_samples`` without
+    further cleanup.
     """
 
     out = pd.DataFrame(index=external_df.index)
@@ -157,4 +182,66 @@ def apply_feature_mapping(
             out[feature] = pd.to_numeric(external_df[mapping.mapped[feature]], errors="coerce")
         else:
             out[feature] = float(train_medians.get(feature, np.nan))
+
+    # --- Detect +inf / -inf before touching anything -------------------
+    raw_values = out.to_numpy(dtype=float)
+    n_pos_inf = int(np.isposinf(raw_values).sum())
+    n_neg_inf = int(np.isneginf(raw_values).sum())
+    n_inf_total = n_pos_inf + n_neg_inf
+    n_nan_before = int(out.isna().sum().sum())
+
+    logger.info(
+        "apply_feature_mapping: pre-sanitization scan -- %d +inf, %d -inf "
+        "(%d total inf), %d NaN across %d rows x %d features.",
+        n_pos_inf, n_neg_inf, n_inf_total, n_nan_before, len(out), len(mapping.cic2017_features),
+    )
+
+    # --- +inf/-inf -> NaN (pandas' fillna() does NOT treat inf as missing) ---
+    out = out.replace([np.inf, -np.inf], np.nan)
+    n_nan_after_inf_replacement = int(out.isna().sum().sum())
+
+    # --- Impute using CIC-IDS2017 TRAINING medians only -----------------
+    out = out.fillna(train_medians)
+
+    n_remaining_nan = int(out.isna().sum().sum())
+    remaining_values = out.to_numpy(dtype=float)
+    n_remaining_inf = int(np.isinf(remaining_values).sum())
+
+    logger.info(
+        "apply_feature_mapping: sanitization complete -- %d value(s) imputed "
+        "with CIC-IDS2017 training medians (%d from inf-replacement, %d "
+        "pre-existing NaN); %d NaN and %d inf remain.",
+        n_nan_after_inf_replacement, n_inf_total, n_nan_before,
+        n_remaining_nan, n_remaining_inf,
+    )
+
+    if n_remaining_nan > 0:
+        raise ValueError(
+            f"apply_feature_mapping: {n_remaining_nan} NaN value(s) remain after "
+            "imputation with CIC-IDS2017 training medians. This likely means a "
+            "CIC-IDS2017 feature's training median is itself NaN/missing -- check "
+            "train_medians for the affected feature(s) before proceeding."
+        )
+    if n_remaining_inf > 0:
+        raise ValueError(
+            f"apply_feature_mapping: {n_remaining_inf} infinite value(s) remain "
+            "after sanitization. This likely means a CIC-IDS2017 training median "
+            "used for imputation is itself +inf/-inf -- check train_medians for "
+            "the affected feature(s) before proceeding."
+        )
+
+    # Attach sanitization stats to the DataFrame so callers (scripts,
+    # notebooks) can report them without recomputing/duplicating this
+    # logic themselves.
+    out.attrs["sanitization"] = {
+        "n_pos_inf_found": n_pos_inf,
+        "n_neg_inf_found": n_neg_inf,
+        "n_inf_total_found": n_inf_total,
+        "n_nan_found_before_imputation": n_nan_before,
+        "n_values_imputed_with_training_medians": n_nan_after_inf_replacement,
+        "n_remaining_nan": n_remaining_nan,
+        "n_remaining_inf": n_remaining_inf,
+        "imputation_source": "CIC-IDS2017 Day 1 training medians only -- never external statistics",
+    }
+
     return out
